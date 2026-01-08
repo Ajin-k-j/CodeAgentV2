@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-multipart
+firebase-admin
+google-generativeai
+langgraph
+langchain-google-genai
+python-dotenv
+pydantic
+pydantic-settings
+httpx

@@ -1,0 +1,300 @@
+﻿from typing import TypedDict, Annotated, List, Dict, Any
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from firebase_client import firebase_client
+from extractor import extractor
+from datetime import datetime
+import os
+import json
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Define State
+class AgentState(TypedDict):
+    messages: List[BaseMessage]
+    context_docs: List[Dict[str, Any]]
+    user_intent: str
+    answer: str
+    used_kb: bool
+    source_ids: List[str]
+    needs_learning: bool
+    learner_asked: bool  # Track if learner already asked for confirmation
+    previous_query: str  # Store the query that generated the answer
+    previous_answer: str  # Store the answer for potential saving
+
+# Initialize LLM
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.0-flash-exp", 
+    temperature=0,
+    google_api_key=os.getenv("GEMINI_API_KEY")
+)
+
+# --- Nodes ---
+
+def classify_intent_node(state: AgentState):
+    """
+    Classifies user intent to determine if KB retrieval is needed.
+    Returns user_intent: 'greeting', 'general_chat', 'clarification', or 'technical'
+    """
+    query = state["messages"][-1].content.strip().lower()
+    
+    # Simple rule-based classification for common cases
+    greetings = ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening', 'howdy', 'greetings']
+    1. Fetches KB index (ID, Title, Tags)
+.
+    2. Uses improved semantic matching to select relevant IDs.
+    3. Fetches full content for selected IDs.
+    """
+    query = state["messages"][-1].content
+    index = firebase_client.fetch_index()
+    
+    if not index:
+        return {"context_docs": []}
+
+    # Format index for LLM with better structure including summary
+    index_str = "\n".join([
+        f"ID: {item['id']}\nTitle: {item['title']}\nTags: {', '.join(item['tags']) if item['tags'] else 'none'}\nSummary: {item.get('summary', 'N/A')}\n"
+        for item in index
+    ])
+    
+    prompt = f"""
+You are a semantic search expert for Hybris/SAP Commerce queries.
+
+User Query: "{query}"
+
+Available Documents (with summaries):
+{index_str}
+
+Task: Select the top 3 most relevant Document IDs that could help answer this query.
+
+Matching Guidelines:
+- Match on semantic meaning using title, tags, AND summary
+- "product query" matches documents with tags like "Product", "flexsearch", "product status", etc.
+- "order query" matches "Order", "flexsearch", "order total", etc.
+- Use summary to understand what lengthy code does
+- Consider partial matches and related concepts
+- If user asks for a "query" or "flexsearch", prioritize docs with "flexsearch" tag
+- If NO documents are even remotely relevant, return empty list []
+
+Output ONLY a JSON array of document IDs (max 3). No explanation.
+Format: ["id1", "id2", "id3"]
+    """
+    
+    try:
+        response = llm.invoke(prompt)
+        content = response.content.replace("```json", "").replace("```", "").strip()
+        selected_ids = json.loads(content)
+        
+        # Ensure it's a list
+        if not isinstance(selected_ids, list):
+            selected_ids = []
+    except Exception as e:
+        print(f"Retrieval error: {e}")
+        selected_ids = []
+        
+    full_docs = firebase_client.fetch_documents(selected_ids)
+    return {"context_docs": full_docs}
+
+def generate_node(state: AgentState):
+    """
+    Generates the response using the retrieved context.
+    Tracks if KB was used and includes source attribution.
+    Defaults to FlexSearch queries for Hybris.
+    """
+    query = state["messages"][-1].content
+    docs = state.get("context_docs", [])
+    
+    # Build context string and track source IDs
+    context_str = ""
+    source_ids = []
+    
+    if docs:
+        for doc in docs:
+            source_ids.append(doc['id'])
+            context_str += f"\n--- Document (ID: {doc['id']}, Status: {doc.get('status', 'unverified')}) ---\n"
+       except Exception as e:
+        print(f"Retrieval error: {e}")
+        selected_ids = []
+        
+    full_docs = firebase_client.fetch_documents(selected_ids)
+    return {"context_docs": full_docs}
+
+def generate_node(state: AgentState):
+    """Generate response using KB or general knowledge."""
+    query = state["messages"][-1].content
+    docs = state.get("context_docs", [])
+    
+    context_str = ""
+    source_ids = []
+    
+    if docs:
+        for doc in docs:
+            source_ids.append(doc['id'])
+            context_str += f"\n--- Document (ID: {doc['id']}, Status: {doc.get('status', 'unverified')}) ---\n"
+            context_str += f"Title: {doc['title']}\nContent:\n{doc.get('content', '')}\n"
+            if doc.get('status') == 'unverified':
+                context_str += "âš ï¸ WARNING: THIS DOCUMENT IS UNVERIFIED.\n"
+    
+    has_kb_context = len(docs) > 0
+    
+    if has_kb_context:
+        prompt = f"""
+You are an expert Hybris Developer Agent. Be CONCISE and DIRECT.
+
+User Query: "{query}"
+
+Knowledge Base Context:
+{context_str}
+
+Instructions:
+1. Answer using the KB context above
+2. Cite sources as [Source: doc_id] for any information from KB
+3. If document is unverified, warn the user
+4. Format code blocks with ```sql for FlexSearch
+5. Be concise - give only what's needed, no extra explanation
+
+Response:
+"""
+    else:
+        prompt = f"""
+You are an expert Hybris Developer Agent. Be CONCISE and DIRECT.
+
+User Query: "{query}"
+
+âš ï¸ IMPORTANT: The Knowledge Base does not contain information about this query.
+
+Instructions:
+1. Start with: "âš ï¸ **Note: This answer is based on general knowledge, not from the Knowledge Base.**"
+2. Provide answer based on Hybris/SAP Commerce knowledge
+3. **DEFAULT TO FLEXSEARCH QUERIES** - Always use FlexSearch SQL syntax, NOT Java/Groovy code
+4. Be CONCISE - provide only the query/code needed, minimal explanation
+5. Format: ```sql for FlexSearch queries
+6. Map terms correctly: 'product table' â†’ Product item type, 'order' â†’ Order item type
+
+Example FlexSearch format:
+```sql
+SELECT {{p:pk}} FROM {{Product as p}} WHERE ...
+```
+
+Response:
+"""
+    
+    response = llm.invoke(prompt)
+    answer_content = response.content
+    
+    return {
+        "answer": answer_content,
+        "messages": [AIMessage(content=answer_content)],
+        "used_kb": has_kb_context,
+        "source_ids": source_ids,
+        "needs_learning": not has_kb_context,
+        "previous_query": query,
+        "previous_answer": answer_content
+    }
+
+def direct_response_node(state: AgentState):
+    """Handle greetings and general conversation."""
+    query = state["messages"][-1].content
+    intent = state.get("user_intent", "general_chat")
+    
+    if intent == "greeting":
+        prompt = f"""
+The user said: "{query}"
+
+Respond warmly as a Hybris Developer AI Agent. Introduce yourself briefly and let them know you can help with:
+- Generating FlexSearch queries
+- Writing Groovy scripts for HAC
+- Creating Impex data
+- Answering Hybris/SAP Commerce questions
+
+Keep it friendly and concise (2-3 sentences max).
+"""
+    else:
+        prompt = f"""
+You are a Hybris Developer AI Agent.
+User: "{query}"
+
+Respond naturally. If vague, ask clarifying questions about:
+- Code generation (FlexSearch, Groovy, Impex)
+- Technical explanation about Hybris
+- Help with a specific Hybris feature
+
+Keep it concise and helpful.
+"""
+    
+    response = llm.invoke(prompt)
+    return {"answer": response.content, "messages": [AIMessage(content=response.content)]}
+
+def learner_node(state: AgentState):
+    """Ask user if the general knowledge answer worked."""
+    if not state.get("needs_learning", False):
+        return {}
+    
+    learner_prompt = """
+
+---
+
+### ðŸ’¡ Learner Agent
+
+Since this answer was generated from general knowledge (not from our Knowledge Base), I'd like to learn from this interaction!
+
+**Did this answer work for you?** 
+
+If this answer solved your problem, I can save it to the Knowledge Base for future reference. Just reply with "yes", "worked", or "correct" and I'll add it automatically!
+
+This helps improve future responses! âœ¨
+"""
+    
+    current_response = state.get("answer", "")
+    updated_response = current_response + learner_prompt
+    
+    return {
+        "answer": updated_response,
+        "messages": [AIMessage(content=updated_response)],
+        "learner_asked": True
+    }
+
+async def learner_save_node(state: AgentState):
+    """Auto-save confirmed answer to KB."""
+    previous_query = state.get("previous_query", "")
+    previous_answer = state.get("previous_answer", "")
+    
+    if not previous_query or not previous_answer:
+        return {"answer": "Sorry, I couldn't find the previous conversation to save."}
+    
+    content = f"**Query:**\n{previous_query}\n\n**Answer:**\n{previous_answer}"
+    
+    try:
+        metadata = await extractor.extract_metadata(content)
+        
+        doc_id = firebase_client.add_document({
+            "title": metadata.title,
+            "content": content,
+            "tags": metadata.tags,
+            "type": "text",
+            "summary": metadata.summary,
+            "status": "unverified",
+            "ai_created": True,
+            "created_at": datetime.now().isoformat()
+        })
+        
+        save_response = f"""
+âœ… **Great! I've saved this to the Knowledge Base.**
+
+**Document Details:**
+- **ID:** {doc_id}
+- **Title:** {metadata.title}
+- **Tags:** {', '.join(metadata.tags)}
+- **Status:** Unverified
+
+[Source: {doc_id}]
+
+**To edit or verify this document:**
+1. Go to the **Knowledge Base** tab
+2. Find the document (it will have a ðŸ¤– "Added by AI" badge)
+3. Click **Edit** to modify title, summary, tags, or content
+4. Click **Verify** if the content is accurate
+
+This will help improve future responses! ðŸŽ‰
