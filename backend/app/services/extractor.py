@@ -9,7 +9,7 @@ class AIExtractor:
         api_key = get_settings().GEMINI_API_KEY
         if api_key:
             genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            self.model = genai.GenerativeModel('gemini-2.0-flash')
         else:
             self.model = None
             print("Warning: GEMINI_API_KEY not found.")
